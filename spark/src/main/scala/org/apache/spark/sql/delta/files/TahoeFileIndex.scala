@@ -19,7 +19,6 @@ package org.apache.spark.sql.delta.files
 // scalastyle:off import.ordering.noEmptyLine
 import java.net.URI
 import java.util.Objects
-
 import org.apache.spark.sql.delta.RowIndexFilterType
 import org.apache.spark.sql.delta.{DeltaColumnMapping, DeltaErrors, DeltaLog, NoMapping, Snapshot, SnapshotDescriptor}
 import org.apache.spark.sql.delta.actions.{AddFile, Metadata, Protocol}
@@ -28,7 +27,7 @@ import org.apache.spark.sql.delta.schema.SchemaUtils
 import org.apache.spark.sql.delta.sources.DeltaSQLConf
 import org.apache.hadoop.fs.FileStatus
 import org.apache.hadoop.fs.Path
-
+import org.apache.spark.internal.Logging
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.expressions.{Cast, Expression, GenericInternalRow, Literal}
@@ -44,7 +43,8 @@ abstract class TahoeFileIndex(
     val path: Path)
   extends FileIndex
   with SupportsRowIndexFilters
-  with SnapshotDescriptor {
+  with SnapshotDescriptor
+  with Logging {
 
   override def rootPaths: Seq[Path] = path :: Nil
 
@@ -231,14 +231,18 @@ case class TahoeLogFileIndex(
   override def matchingFiles(
       partitionFilters: Seq[Expression],
       dataFilters: Seq[Expression]): Seq[AddFile] = {
-    getSnapshot.filesForScan(this.partitionFilters ++ partitionFilters ++ dataFilters).files
+    val matchingFilesList = getSnapshot.filesForScan(this.partitionFilters ++
+      partitionFilters ++ dataFilters).files
+    logWarning("Delta Trace: " + matchingFilesList.mkString(","))
+    matchingFilesList
   }
 
   override def inputFiles: Array[String] = {
-    getSnapshot
+    val inputFilesList = getSnapshot
       .filesForScan(partitionFilters).files
       .map(f => absolutePath(f.path).toString)
-      .toArray
+    logWarning("Delta Trace: " + inputFilesList.mkString(","))
+    inputFilesList.toArray
   }
 
   override def refresh(): Unit = {}
