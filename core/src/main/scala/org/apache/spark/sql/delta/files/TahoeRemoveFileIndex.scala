@@ -77,13 +77,20 @@ class TahoeRemoveFileIndex(
           )
         }
     }
-    DeltaLog.filterFileList(partitionSchema, addFiles.toDF(spark), partitionFilters)
+    val matchingFilesList = DeltaLog.filterFileList(partitionSchema, addFiles.toDF(spark),
+        partitionFilters)
       .as[AddFile]
       .collect()
+    logWarning("DeltaTrace: " + matchingFilesList.map(f => absolutePath(f.path).toString)
+      .mkString(","))
+    matchingFilesList
   }
 
   override def inputFiles: Array[String] = {
-    filesByVersion.flatMap(_.actions).map(f => absolutePath(f.path).toString).toArray
+    val inputFilesList = filesByVersion.flatMap(_.actions).map(f => absolutePath(f.path).toString)
+      .toArray
+    logWarning("DeltaTrace: " + inputFilesList.mkString(","))
+    inputFilesList
   }
 
   override def partitionSchema: StructType = CDCReader.cdcReadSchema(super.partitionSchema)

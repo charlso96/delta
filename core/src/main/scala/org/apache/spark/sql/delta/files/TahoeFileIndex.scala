@@ -278,13 +278,19 @@ class TahoeBatchFileIndex(
   override def matchingFiles(
       partitionFilters: Seq[Expression],
       dataFilters: Seq[Expression]): Seq[AddFile] = {
-    DeltaLog.filterFileList(partitionSchema, addFiles.toDF(spark), partitionFilters)
+      val matchingFilesList = DeltaLog.filterFileList(partitionSchema,
+          addFiles.toDF(spark), partitionFilters)
       .as[AddFile]
       .collect()
+      logWarning("Delta Trace: " + matchingFilesList.map(a =>
+        absolutePath(a.path).toString).mkString(","))
+      matchingFilesList
   }
 
   override def inputFiles: Array[String] = {
-    addFiles.map(a => absolutePath(a.path).toString).toArray
+    val inputFilesList = addFiles.map(a => absolutePath(a.path).toString).toArray
+    logWarning("Delta Trace: " + inputFilesList.mkString(",") )
+    inputFilesList
   }
 
   override def refresh(): Unit = {}

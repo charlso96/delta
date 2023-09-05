@@ -365,6 +365,8 @@ case class PreparedDeltaFileIndex(
     recordDeltaEvent(deltaLog,
       opType = "delta.preparedDeltaFileIndex.reuseSkippingResult",
       data = eventData)
+    logWarning("Delta Trace: " + addFiles.map(a =>
+      absolutePath(a.path).toString).mkString(","))
     addFiles
   }
 
@@ -372,8 +374,11 @@ case class PreparedDeltaFileIndex(
    * Returns the list of files that will be read when scanning this relation. This call may be
    * very expensive for large tables.
    */
-  override def inputFiles: Array[String] =
-    preparedScan.files.map(f => absolutePath(f.path).toString).toArray
+  override def inputFiles: Array[String] = {
+    val inputFilesList = preparedScan.files.map(f => absolutePath(f.path).toString)
+    logWarning("Delta Trace: " + inputFilesList.mkString(","))
+    inputFilesList.toArray
+  }
 
   /** Refresh any cached file listings */
   override def refresh(): Unit = { }

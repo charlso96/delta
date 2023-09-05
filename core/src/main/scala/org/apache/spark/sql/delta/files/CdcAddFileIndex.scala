@@ -67,13 +67,20 @@ class CdcAddFileIndex(
           f.copy(partitionValues = newPartitionVals)
         }
     }
-    DeltaLog.filterFileList(partitionSchema, addFiles.toDF(spark), partitionFilters)
+    val matchingFilesList = DeltaLog.filterFileList(partitionSchema, addFiles.toDF(spark),
+        partitionFilters)
       .as[AddFile]
       .collect()
+    logWarning("Delta Trace: " +
+      matchingFilesList.map(f => absolutePath(f.path).toString).mkString(","))
+    matchingFilesList
   }
 
   override def inputFiles: Array[String] = {
-    filesByVersion.flatMap(_.actions).map(f => absolutePath(f.path).toString).toArray
+    val inputFilesList = filesByVersion.flatMap(_.actions).map(f =>
+      absolutePath(f.path).toString).toArray
+    logWarning("Delta Trace: " + inputFilesList.mkString(","))
+    inputFilesList
   }
 
   override val partitionSchema: StructType =

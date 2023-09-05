@@ -53,13 +53,20 @@ class TahoeChangeFileIndex(
           AddFile(f.path, newPartitionVals, f.size, 0, dataChange = false, tags = f.tags)
         }
     }
-    DeltaLog.filterFileList(partitionSchema, addFiles.toDF(spark), partitionFilters)
+    val matchingFilesList = DeltaLog.filterFileList(partitionSchema, addFiles.toDF(spark),
+        partitionFilters)
       .as[AddFile]
       .collect()
+    logWarning("Delta Trace: " + matchingFilesList.map(f => absolutePath(f.path)
+      .toString).mkString(","))
+    matchingFilesList
   }
 
   override def inputFiles: Array[String] = {
-    filesByVersion.flatMap(_.actions).map(f => absolutePath(f.path).toString).toArray
+    val inputFilesList = filesByVersion.flatMap(_.actions).map(f => absolutePath(f.path).toString)
+      .toArray
+    logWarning("Delta Trace: " + inputFilesList.mkString(","))
+    inputFilesList
   }
 
   override val partitionSchema: StructType = super.partitionSchema
