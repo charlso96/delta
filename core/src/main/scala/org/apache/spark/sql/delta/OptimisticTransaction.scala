@@ -981,6 +981,7 @@ trait OptimisticTransactionImpl extends TransactionalWrite
 
       // Try to commit at the next version.
       val preparedActions = prepareCommit(finalActions, op)
+      logWarning("Delta Trace: " + preparedActions.map(a => a.json).mkString(","))
 
       // Find the isolation level to use for this commit
       val isolationLevelToUse = getIsolationLevelToUse(preparedActions, op)
