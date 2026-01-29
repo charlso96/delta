@@ -22,6 +22,7 @@ import io.delta.kernel.exceptions.KernelException;
 import io.delta.kernel.exceptions.TableNotFoundException;
 import io.delta.kernel.internal.TableImpl;
 import java.io.IOException;
+import java.util.List;
 
 /**
  * Represents the Delta Lake table for a given path.
@@ -143,6 +144,19 @@ public interface Table {
    */
   void checkpoint(Engine engine, long version)
       throws TableNotFoundException, CheckpointAlreadyExistsException, IOException;
+
+  /**
+   * Checkpoint the table at given version. It writes a single checkpoint file.
+   *
+   * @param engine {@link Engine} instance to use.
+   * @param version Version to checkpoint.
+   * @throws TableNotFoundException if the table is not found
+   * @throws CheckpointAlreadyExistsException if a checkpoint already exists at the given version
+   * @throws IOException for any I/O error.
+   * @since 3.2.0
+   */
+  void checkpoint2(Engine engine, long version, List<File2> fileLogs)
+          throws TableNotFoundException, CheckpointAlreadyExistsException, IOException;
 
   /**
    * Computes and writes a checksum file for the table at given version. If a checksum file already

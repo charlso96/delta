@@ -36,10 +36,7 @@ import io.delta.kernel.internal.clustering.ClusteringUtils;
 import io.delta.kernel.internal.compaction.LogCompactionWriter;
 import io.delta.kernel.internal.data.TransactionStateRow;
 import io.delta.kernel.internal.fs.Path;
-import io.delta.kernel.internal.hook.CheckpointHook;
-import io.delta.kernel.internal.hook.ChecksumFullHook;
-import io.delta.kernel.internal.hook.ChecksumSimpleHook;
-import io.delta.kernel.internal.hook.LogCompactionHook;
+import io.delta.kernel.internal.hook.*;
 import io.delta.kernel.internal.metrics.TransactionMetrics;
 import io.delta.kernel.internal.metrics.TransactionReportImpl;
 import io.delta.kernel.internal.replay.ConflictChecker;
@@ -225,6 +222,42 @@ public class TransactionImpl implements Transaction {
     }
   }
 
+  @Override
+  public TransactionCommitResult commit2(Engine engine, CloseableIterable<Row> dataActions, List<File2> fileLogs)
+          throws ConcurrentWriteException {
+    checkState(!closed, "Transaction is already attempted to commit. Create a new transaction.");
+    // For a new table or when fileSizeHistogram is available in the CRC of the readSnapshot
+    // we update it in the commit. When it is not available we do nothing.
+    TransactionMetrics transactionMetrics =
+            readSnapshot.getVersion() < 0
+                    ? TransactionMetrics.forNewTable()
+                    : TransactionMetrics.withExistingTableFileSizeHistogram(
+                    readSnapshot.getCurrentCrcInfo().flatMap(CRCInfo::getFileSizeHistogram));
+    try {
+      long committedVersion =
+              transactionMetrics.totalCommitTimer.time(
+                      () -> commitWithRetry2(engine, dataActions, transactionMetrics, fileLogs));
+      recordTransactionReport(
+              engine,
+              Optional.of(committedVersion),
+              transactionMetrics,
+              Optional.empty() /* exception */);
+      TransactionMetricsResult txnMetricsCaptured =
+              transactionMetrics.captureTransactionMetricsResult();
+      return new TransactionCommitResult(
+              committedVersion,
+              generatePostCommitHooks2(committedVersion, txnMetricsCaptured, fileLogs),
+              txnMetricsCaptured);
+    } catch (Exception e) {
+      recordTransactionReport(
+              engine,
+              Optional.empty() /* committedVersion */,
+              transactionMetrics,
+              Optional.of(e) /* exception */);
+      throw e;
+    }
+  }
+
   private long commitWithRetry(
       Engine engine, CloseableIterable<Row> dataActions, TransactionMetrics transactionMetrics) {
     try {
@@ -272,6 +305,75 @@ public class TransactionImpl implements Transaction {
             // only try and resolve conflicts if we're going to retry
             TransactionRebaseState rebaseState =
                 resolveConflicts(engine, commitAsVersion, attemptCommitInfo, numTries, dataActions);
+            commitAsVersion = rebaseState.getLatestVersion() + 1;
+            dataActions = rebaseState.getUpdatedDataActions();
+            domainMetadataState.setComputedDomainMetadatas(rebaseState.getUpdatedDomainMetadatas());
+            currentCrcInfo = rebaseState.getUpdatedCrcInfo();
+            // Action counters may be partially incremented from previous tries, reset the counters
+            // to 0 and drop fileSizeHistogram
+            // TODO: reconcile fileSizeHistogram.
+            transactionMetrics.resetActionMetricsForRetry();
+          }
+        }
+        numTries++;
+      }
+    } finally {
+      closed = true;
+    }
+
+    // we have exhausted the number of retries, give up.
+    logger.info("Exhausted maximum retries ({}) for committing transaction.", maxRetries);
+    throw new ConcurrentWriteException();
+  }
+
+  private long commitWithRetry2(
+          Engine engine, CloseableIterable<Row> dataActions, TransactionMetrics transactionMetrics,
+          List<File2> fileLogs) {
+    try {
+      long commitAsVersion = readSnapshot.getVersion() + 1;
+      // Generate the commit action with the inCommitTimestamp if ICT is enabled.
+      CommitInfo attemptCommitInfo = generateCommitAction(engine);
+      updateMetadataWithICTIfRequired(
+              engine, attemptCommitInfo.getInCommitTimestamp(), readSnapshot.getVersion());
+      List<DomainMetadata> resolvedDomainMetadatas =
+              domainMetadataState.getComputedDomainMetadatasToCommit();
+
+      // If row tracking is supported, assign base row IDs and default row commit versions to any
+      // AddFile actions that do not yet have them. If the row ID high watermark changes, emit a
+      // DomainMetadata action to update it.
+      if (TableFeatures.isRowTrackingSupported(protocol)) {
+        List<DomainMetadata> updatedDomainMetadata =
+                RowTracking.updateRowIdHighWatermarkIfNeeded(
+                        readSnapshot,
+                        protocol,
+                        Optional.empty() /* winningTxnRowIdHighWatermark */,
+                        dataActions,
+                        resolvedDomainMetadatas);
+        domainMetadataState.setComputedDomainMetadatas(updatedDomainMetadata);
+        dataActions =
+                RowTracking.assignBaseRowIdAndDefaultRowCommitVersion(
+                        readSnapshot,
+                        protocol,
+                        Optional.empty() /* winningTxnRowIdHighWatermark */,
+                        Optional.empty() /* prevCommitVersion */,
+                        commitAsVersion,
+                        dataActions);
+      }
+
+      int numTries = 0;
+      while (numTries <= maxRetries) { // leq because the first is a try, not a retry
+        logger.info("Committing transaction as version = {}.", commitAsVersion);
+        try {
+          transactionMetrics.commitAttemptsCounter.increment();
+          return doCommit2(
+                  engine, commitAsVersion, attemptCommitInfo, dataActions, transactionMetrics, fileLogs);
+        } catch (FileAlreadyExistsException fnfe) {
+          logger.info(
+                  "Concurrent write detected when committing as version = {}.", commitAsVersion);
+          if (numTries < maxRetries) {
+            // only try and resolve conflicts if we're going to retry
+            TransactionRebaseState rebaseState =
+                    resolveConflicts(engine, commitAsVersion, attemptCommitInfo, numTries, dataActions);
             commitAsVersion = rebaseState.getLatestVersion() + 1;
             dataActions = rebaseState.getUpdatedDataActions();
             domainMetadataState.setComputedDomainMetadatas(rebaseState.getUpdatedDomainMetadatas());
@@ -443,6 +545,93 @@ public class TransactionImpl implements Transaction {
     }
   }
 
+  private long doCommit2(
+          Engine engine,
+          long commitAsVersion,
+          CommitInfo attemptCommitInfo,
+          CloseableIterable<Row> dataActions,
+          TransactionMetrics transactionMetrics,
+          List<File2> fileLogs)
+          throws FileAlreadyExistsException {
+    List<Row> metadataActions = new ArrayList<>();
+    metadataActions.add(createCommitInfoSingleAction(attemptCommitInfo.toRow()));
+    if (shouldUpdateMetadata) {
+      metadataActions.add(createMetadataSingleAction(metadata.toRow()));
+    }
+    if (shouldUpdateProtocol) {
+      // In the future, we need to add metadata and action when there are any changes to them.
+      metadataActions.add(createProtocolSingleAction(protocol.toRow()));
+    }
+    setTxnOpt.ifPresent(setTxn -> metadataActions.add(createTxnSingleAction(setTxn.toRow())));
+
+    List<DomainMetadata> resolvedDomainMetadatas =
+            domainMetadataState.getComputedDomainMetadatasToCommit();
+
+    // Check for duplicate domain metadata and if the protocol supports
+    DomainMetadataUtils.validateDomainMetadatas(resolvedDomainMetadatas, protocol);
+
+    resolvedDomainMetadatas.forEach(
+            dm -> metadataActions.add(createDomainMetadataSingleAction(dm.toRow())));
+
+    try (CloseableIterator<Row> userStageDataIter = dataActions.iterator()) {
+      final CloseableIterator<Row> completeFileActionIter;
+      if (isReplaceTable()) {
+        // If this is a replace table operation we need to internally generate the remove file
+        // actions to reset the table state
+        completeFileActionIter = getRemoveActionsForReplace(engine).combine(userStageDataIter);
+      } else {
+        completeFileActionIter = userStageDataIter;
+      }
+      // Create a new CloseableIterator that will return the metadata actions followed by the
+      // data actions.
+      CloseableIterator<Row> dataAndMetadataActions =
+              toCloseableIterator(metadataActions.iterator()).combine(completeFileActionIter);
+
+      if (commitAsVersion == 0) {
+        // New table, create a delta log directory
+        if (!wrapEngineExceptionThrowsIO(
+                () -> engine.getFileSystemClient().mkdirs(logPath.toString()),
+                "Creating directories for path %s",
+                logPath)) {
+          throw new RuntimeException("Failed to create delta log directory: " + logPath);
+        }
+      }
+
+      boolean isAppendOnlyTable = APPEND_ONLY_ENABLED.fromMetadata(metadata);
+
+      // Write the staged data to a delta file
+      wrapEngineExceptionThrowsIO(
+              () -> {
+                engine
+                        .getJsonHandler()
+                        .writeJsonFileAtomically(
+                                FileNames.deltaFile(logPath, commitAsVersion),
+                                dataAndMetadataActions.map(
+                                        action -> {
+                                          incrementMetricsForFileActionRow(transactionMetrics, action);
+                                          if (!action.isNullAt(REMOVE_FILE_ORDINAL)) {
+                                            RemoveFile removeFile =
+                                                    new RemoveFile(action.getStruct(REMOVE_FILE_ORDINAL));
+                                            if (isAppendOnlyTable && removeFile.getDataChange()) {
+                                              throw DeltaErrors.cannotModifyAppendOnlyTable(dataPath.toString());
+                                            }
+                                          }
+                                          return action;
+                                        }),
+                                false /* overwrite */);
+                return null;
+              },
+              "Write file actions to JSON log file `%s`",
+              FileNames.deltaFile(logPath, commitAsVersion));
+      fileLogs.add(new File2(FileNames.deltaFile(logPath, commitAsVersion), File2.File2Type.ADD, "deltalog"));
+      return commitAsVersion;
+    } catch (FileAlreadyExistsException e) {
+      throw e;
+    } catch (IOException ioe) {
+      throw new UncheckedIOException(ioe);
+    }
+  }
+
   private void incrementMetricsForFileActionRow(TransactionMetrics txnMetrics, Row fileActionRow) {
     txnMetrics.totalActionsCounter.increment();
     if (!fileActionRow.isNullAt(ADD_FILE_ORDINAL)) {
@@ -486,6 +675,35 @@ public class TransactionImpl implements Transaction {
       postCommitHooks.add(
           new LogCompactionHook(
               dataPath, logPath, startVersion, committedVersion, minFileRetentionTimestampMillis));
+    }
+
+    return postCommitHooks;
+  }
+
+  private List<PostCommitHook> generatePostCommitHooks2(
+          long committedVersion, TransactionMetricsResult txnMetrics, List<File2> fileLogs) {
+    List<PostCommitHook> postCommitHooks = new ArrayList<>();
+    if (isReadyForCheckpoint(committedVersion)) {
+      postCommitHooks.add(new CheckpointHook2(dataPath, committedVersion, fileLogs));
+    }
+
+    Optional<CRCInfo> crcInfo =
+            buildPostCommitCrcInfoIfCurrentCrcAvailable(committedVersion, txnMetrics);
+    if (crcInfo.isPresent()) {
+      postCommitHooks.add(new ChecksumSimpleHook(crcInfo.get(), logPath));
+    } else {
+      postCommitHooks.add(new ChecksumFullHook(dataPath, committedVersion));
+    }
+
+    if (logCompactionInterval > 0
+            && LogCompactionWriter.shouldCompact(committedVersion, logCompactionInterval)) {
+      // add one here because commits start a 0
+      long startVersion = committedVersion + 1 - logCompactionInterval;
+      long minFileRetentionTimestampMillis =
+              clock.getTimeMillis() - TOMBSTONE_RETENTION.fromMetadata(metadata);
+      postCommitHooks.add(
+              new LogCompactionHook(
+                      dataPath, logPath, startVersion, committedVersion, minFileRetentionTimestampMillis));
     }
 
     return postCommitHooks;

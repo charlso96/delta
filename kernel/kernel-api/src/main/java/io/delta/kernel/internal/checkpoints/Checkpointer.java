@@ -21,6 +21,7 @@ import static io.delta.kernel.internal.TableConfig.LOG_RETENTION;
 import static io.delta.kernel.internal.snapshot.MetadataCleanup.cleanupExpiredLogs;
 import static io.delta.kernel.internal.util.Utils.singletonCloseableIterator;
 
+import io.delta.kernel.File2;
 import io.delta.kernel.data.ColumnarBatch;
 import io.delta.kernel.data.Row;
 import io.delta.kernel.engine.Engine;
@@ -112,6 +113,65 @@ public class Checkpointer {
     } else {
       logger.info(
           "{}: Log cleanup is disabled. Skipping the deletion of expired log files", tablePath);
+    }
+  }
+
+  public static void checkpoint2(Engine engine, Clock clock, SnapshotImpl snapshot, List<File2> fileLogs)
+          throws TableNotFoundException, IOException {
+    final Path tablePath = snapshot.getDataPath();
+    final Path logPath = snapshot.getLogPath();
+    final long version = snapshot.getVersion();
+
+    logger.info("{}: Starting checkpoint for version: {}", tablePath, version);
+
+    // Check if writing to the given table protocol version/features is supported in Kernel
+    TableFeatures.validateKernelCanWriteToTable(
+            snapshot.getProtocol(), snapshot.getMetadata(), snapshot.getDataPath().toString());
+
+    final Path checkpointPath = FileNames.checkpointFileSingular(logPath, version);
+
+    long numberOfAddFiles = 0;
+    try (CreateCheckpointIterator checkpointDataIter =
+                 snapshot.getCreateCheckpointIterator(engine)) {
+      // Write the iterator actions to the checkpoint using the Parquet handler
+      wrapEngineExceptionThrowsIO(
+              () -> {
+                engine
+                        .getParquetHandler()
+                        .writeParquetFileAtomically(checkpointPath.toString(), checkpointDataIter);
+
+                logger.info("{}: Finished writing checkpoint file for version: {}", tablePath, version);
+
+                return null;
+              },
+              "Writing checkpoint file %s",
+              checkpointPath.toString());
+      fileLogs.add(new File2(checkpointPath.toString(), File2.File2Type.ADD, "checkpoint"));
+      // Get the metadata of the checkpoint file
+      numberOfAddFiles = checkpointDataIter.getNumberOfAddActions();
+    } catch (IOException e) {
+      if (e instanceof FileAlreadyExistsException
+              || e.getCause() instanceof FileAlreadyExistsException) {
+        throw new CheckpointAlreadyExistsException(version);
+      }
+      throw e;
+    }
+
+    final CheckpointMetaData checkpointMetaData =
+            new CheckpointMetaData(version, numberOfAddFiles, Optional.empty());
+
+    new Checkpointer(logPath).writeLastCheckpointFile(engine, checkpointMetaData);
+
+    logger.info(
+            "{}: Finished writing last checkpoint metadata file for version: {}", tablePath, version);
+
+    // Clean up delta log files if enabled.
+    final Metadata metadata = snapshot.getMetadata();
+    if (EXPIRED_LOG_CLEANUP_ENABLED.fromMetadata(metadata)) {
+      cleanupExpiredLogs(engine, clock, tablePath, LOG_RETENTION.fromMetadata(metadata));
+    } else {
+      logger.info(
+              "{}: Log cleanup is disabled. Skipping the deletion of expired log files", tablePath);
     }
   }
 

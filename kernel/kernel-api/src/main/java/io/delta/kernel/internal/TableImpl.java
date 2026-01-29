@@ -143,6 +143,14 @@ public class TableImpl implements Table {
   }
 
   @Override
+  public void checkpoint2(Engine engine, long version, List<File2> fileLogs)
+          throws TableNotFoundException, CheckpointAlreadyExistsException, IOException {
+    final SnapshotImpl snapshotToCheckpoint =
+            (SnapshotImpl) getSnapshotAsOfVersion(engine, version);
+    checkpointer.checkpoint2(engine, clock, snapshotToCheckpoint, fileLogs);
+  }
+
+  @Override
   public void checksum(Engine engine, long version) throws TableNotFoundException, IOException {
     final SnapshotImpl snapshotToWriteCrcFile =
         (SnapshotImpl) getSnapshotAsOfVersion(engine, version);
