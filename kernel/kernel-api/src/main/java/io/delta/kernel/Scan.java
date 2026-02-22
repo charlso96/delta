@@ -228,4 +228,115 @@ public interface Scan {
       }
     };
   }
+
+  /**
+   * Transform the physical data read from the table data file into the logical data that expected
+   * out of the Delta table.
+   *
+   * @param engine Connector provided {@link Engine} implementation.
+   * @param scanState Scan state returned by {@link Scan#getScanState(Engine)}
+   * @param physicalDataIter Iterator of {@link ColumnarBatch}s containing the physical data read
+   *     from the {@code scanFile}.
+   * @return Data read from the input scan files as an iterator of {@link FilteredColumnarBatch}s.
+   *     Each {@link FilteredColumnarBatch} instance contains the data read and an optional
+   *     selection vector that indicates data rows as valid or invalid. It is the responsibility of
+   *     the caller to close this iterator.
+   * @throws IOException when error occurs while reading the data.
+   */
+  static CloseableIterator<FilteredColumnarBatch> transformPhysicalData2(
+          Engine engine, Row scanState, CloseableIterator<ColumnarBatch> physicalDataIter)
+          throws IOException {
+    return new CloseableIterator<FilteredColumnarBatch>() {
+      boolean inited = false;
+
+      // initialized as part of init()
+      StructType physicalReadSchema = null;
+      StructType logicalReadSchema = null;
+      String tablePath = null;
+
+      RoaringBitmapArray currBitmap = null;
+      DeletionVectorDescriptor currDV = null;
+
+      private void initIfRequired() {
+        if (inited) {
+          return;
+        }
+        physicalReadSchema = ScanStateRow.getPhysicalSchema(scanState);
+        logicalReadSchema = ScanStateRow.getLogicalSchema(scanState);
+
+        tablePath = ScanStateRow.getTableRoot(scanState);
+        inited = true;
+      }
+
+      @Override
+      public void close() throws IOException {
+        physicalDataIter.close();
+      }
+
+      @Override
+      public boolean hasNext() {
+        initIfRequired();
+        return physicalDataIter.hasNext();
+      }
+
+      @Override
+      public FilteredColumnarBatch next() {
+        initIfRequired();
+        ColumnarBatch nextDataBatch = physicalDataIter.next();
+
+        DeletionVectorDescriptor dv = null;
+        // We don't use deletion vector
+//                InternalScanFileUtils.getDeletionVectorDescriptorFromRow(scanFile);
+
+        int rowIndexOrdinal =
+                nextDataBatch.getSchema().indexOf(StructField.METADATA_ROW_INDEX_COLUMN_NAME);
+
+        // Get the selectionVector if DV is present
+        Optional<ColumnVector> selectionVector;
+        if (dv == null) {
+          selectionVector = Optional.empty();
+        } else {
+          if (rowIndexOrdinal == -1) {
+            throw new IllegalArgumentException(
+                    "Row index column is not " + "present in the data read from the Parquet file.");
+          }
+          if (!dv.equals(currDV)) {
+            Tuple2<DeletionVectorDescriptor, RoaringBitmapArray> dvInfo =
+                    DeletionVectorUtils.loadNewDvAndBitmap(engine, tablePath, dv);
+            this.currDV = dvInfo._1;
+            this.currBitmap = dvInfo._2;
+          }
+          ColumnVector rowIndexVector = nextDataBatch.getColumnVector(rowIndexOrdinal);
+          selectionVector = Optional.of(new SelectionColumnVector(currBitmap, rowIndexVector));
+        }
+        if (rowIndexOrdinal != -1) {
+          nextDataBatch = nextDataBatch.withDeletedColumnAt(rowIndexOrdinal);
+        }
+// We don't use partitioning, so no need to add back partition column to the data
+        // Add partition columns
+//        nextDataBatch =
+//                PartitionUtils.withPartitionColumns(
+//                        engine.getExpressionHandler(),
+//                        nextDataBatch,
+//                        InternalScanFileUtils.getPartitionValues(scanFile),
+//                        physicalReadSchema);
+
+        // Change back to logical schema
+        ColumnMappingMode columnMappingMode = ScanStateRow.getColumnMappingMode(scanState);
+        switch (columnMappingMode) {
+          case NAME: // fall through
+          case ID:
+            nextDataBatch = nextDataBatch.withNewSchema(logicalReadSchema);
+            break;
+          case NONE:
+            break;
+          default:
+            throw new UnsupportedOperationException(
+                    "Column mapping mode is not yet supported: " + columnMappingMode);
+        }
+
+        return new FilteredColumnarBatch(nextDataBatch, selectionVector);
+      }
+    };
+  }
 }
