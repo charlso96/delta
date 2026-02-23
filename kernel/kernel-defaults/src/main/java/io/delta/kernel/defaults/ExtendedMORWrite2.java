@@ -51,11 +51,8 @@ import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.time.Duration;
 import java.time.Instant;
-import java.time.LocalTime;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.function.Consumer;
 
 import static io.delta.kernel.internal.util.Utils.toCloseableIterator;
 import static java.nio.charset.StandardCharsets.UTF_8;
