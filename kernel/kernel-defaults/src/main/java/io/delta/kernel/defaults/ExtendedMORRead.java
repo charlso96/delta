@@ -38,6 +38,7 @@ import io.delta.kernel.expressions.Column;
 import io.delta.kernel.expressions.Literal;
 import io.delta.kernel.expressions.Predicate;
 import io.delta.kernel.engine.Engine;
+import io.delta.kernel.hook.PostCommitHook;
 import io.delta.kernel.internal.InternalScanFileUtils;
 import io.delta.kernel.internal.data.ScanStateRow;
 import io.delta.kernel.types.IntegerType;
@@ -278,6 +279,14 @@ public class ExtendedMORRead {
     txnBuilder = txnBuilder.withSchema(engine, SCHEMA);
     Transaction txn = txnBuilder.build(engine);
     TransactionCommitResult commitResult = txn.commit(engine, CloseableIterable.emptyIterable());
+    List<PostCommitHook> postCommitHooks = commitResult.getPostCommitHooks();
+    for (PostCommitHook postCommitHook : postCommitHooks) {
+      try {
+        postCommitHook.threadSafeInvoke(engine);
+      } catch (IOException e) {
+        throw new RuntimeException(e);
+      }
+    }
 
     ravenCatalog = new RavenCatalog(ravenAddress);
     populateRavenExp();
@@ -302,6 +311,14 @@ public class ExtendedMORRead {
     txnBuilder = txnBuilder.withSchema(engine, SCHEMA);
     Transaction txn = txnBuilder.build(engine);
     TransactionCommitResult commitResult = txn.commit(engine, CloseableIterable.emptyIterable());
+    List<PostCommitHook> postCommitHooks = commitResult.getPostCommitHooks();
+    for (PostCommitHook postCommitHook : postCommitHooks) {
+      try {
+        postCommitHook.threadSafeInvoke(engine);
+      } catch (IOException e) {
+        throw new RuntimeException(e);
+      }
+    }
 
     populateVanillaExp();
     try {
@@ -412,6 +429,14 @@ public class ExtendedMORRead {
         CloseableIterable<Row> dataActionsIterable = CloseableIterable.inMemoryIterable(dataActions);
 
         TransactionCommitResult commitResult = txn.commit2(engine, dataActionsIterable, fileLogs);
+        List<PostCommitHook> postCommitHooks = commitResult.getPostCommitHooks();
+        for (PostCommitHook postCommitHook : postCommitHooks) {
+          try {
+            postCommitHook.threadSafeInvoke(engine);
+          } catch (IOException e) {
+            throw new RuntimeException(e);
+          }
+        }
 
         // 4. Replace the newdata files with different tags, add the delta log file (and checkpoint file).
         List<String> filesToReplace = Lists.newArrayList();
@@ -598,6 +623,14 @@ public class ExtendedMORRead {
       CloseableIterable<Row> dataActionsIterable = CloseableIterable.inMemoryIterable(dataActions);
 
       TransactionCommitResult commitResult = txn.commit2(engine, dataActionsIterable, fileLogs);
+      List<PostCommitHook> postCommitHooks = commitResult.getPostCommitHooks();
+      for (PostCommitHook postCommitHook : postCommitHooks) {
+        try {
+          postCommitHook.threadSafeInvoke(engine);
+        } catch (IOException e) {
+          throw new RuntimeException(e);
+        }
+      }
 
     }
   }

@@ -34,6 +34,7 @@ import io.delta.kernel.defaults.engine.fileio.FileIO;
 import io.delta.kernel.defaults.engine.hadoopio.HadoopFileIO;
 import io.delta.kernel.defaults.internal.data.DefaultColumnarBatch;
 import io.delta.kernel.engine.Engine;
+import io.delta.kernel.hook.PostCommitHook;
 import io.delta.kernel.types.IntegerType;
 import io.delta.kernel.types.StringType;
 import io.delta.kernel.types.StructField;
@@ -274,6 +275,14 @@ public class MultiTableTxn1 {
       txnBuilder = txnBuilder.withSchema(engine, schema);
       Transaction txn = txnBuilder.build(engine);
       TransactionCommitResult commitResult = txn.commit(engine, CloseableIterable.emptyIterable());
+      List<PostCommitHook> postCommitHooks = commitResult.getPostCommitHooks();
+      for (PostCommitHook postCommitHook : postCommitHooks) {
+        try {
+          postCommitHook.threadSafeInvoke(engine);
+        } catch (IOException e) {
+          throw new RuntimeException(e);
+        }
+      }
     }
 
     ravenCatalog = new RavenCatalog(ravenAddress);
@@ -298,6 +307,14 @@ public class MultiTableTxn1 {
       txnBuilder = txnBuilder.withSchema(engine, schema);
       Transaction txn = txnBuilder.build(engine);
       TransactionCommitResult commitResult = txn.commit(engine, CloseableIterable.emptyIterable());
+      List<PostCommitHook> postCommitHooks = commitResult.getPostCommitHooks();
+      for (PostCommitHook postCommitHook : postCommitHooks) {
+        try {
+          postCommitHook.threadSafeInvoke(engine);
+        } catch (IOException e) {
+          throw new RuntimeException(e);
+        }
+      }
     }
 
     LocalTime duration = LocalTime.parse(durationStr);
@@ -399,6 +416,14 @@ public class MultiTableTxn1 {
 
           TransactionCommitResult commitResult = txns.get(i).commit2(engine, dataActionsIterables.get(i),
                   curFileLogs);
+          List<PostCommitHook> postCommitHooks = commitResult.getPostCommitHooks();
+          for (PostCommitHook postCommitHook : postCommitHooks) {
+            try {
+              postCommitHook.threadSafeInvoke(engine);
+            } catch (IOException e) {
+              throw new RuntimeException(e);
+            }
+          }
 
           List<FileObject> newDataFiles = Lists.newArrayList();
           List<String> filesToReplace = Lists.newArrayList();
@@ -508,7 +533,16 @@ public class MultiTableTxn1 {
         for (int i = 0 ; i < tableIdxList.size(); i++) {
           TransactionCommitResult commitResult = txns.get(i).commit2(engine, dataActionsIterables.get(i),
                   fileLogs);
+          List<PostCommitHook> postCommitHooks = commitResult.getPostCommitHooks();
+          for (PostCommitHook postCommitHook : postCommitHooks) {
+            try {
+              postCommitHook.threadSafeInvoke(engine);
+            } catch (IOException e) {
+              throw new RuntimeException(e);
+            }
+          }
         }
+
 
         Instant afterCommit = Instant.now();
 
