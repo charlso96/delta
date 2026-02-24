@@ -690,7 +690,7 @@ public class TransactionImpl implements Transaction {
     Optional<CRCInfo> crcInfo =
             buildPostCommitCrcInfoIfCurrentCrcAvailable(committedVersion, txnMetrics);
     if (crcInfo.isPresent()) {
-      postCommitHooks.add(new ChecksumSimpleHook(crcInfo.get(), logPath));
+      postCommitHooks.add(new ChecksumSimpleHook2(crcInfo.get(), logPath, fileLogs));
     } else {
       postCommitHooks.add(new ChecksumFullHook(dataPath, committedVersion));
     }
