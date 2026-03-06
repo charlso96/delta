@@ -184,6 +184,7 @@ public class ExtendedMORRead {
 
   private static final ObjectMapper JSON_MAPPER = new ObjectMapper();
   private static String expType;
+  private static String populate;
   private static String workspaceName;
   private static String dbName;
   private static String tableName;
@@ -218,6 +219,7 @@ public class ExtendedMORRead {
 
   // thread pool for s3 operations
   private static ExecutorService s3Executors;
+  private static ExecutorService readExecutors;
 
   public static Map<String, String> parseJsonToMap(String jsonFilePath) throws IOException {
     File file = new File(jsonFilePath);
@@ -244,6 +246,7 @@ public class ExtendedMORRead {
   public static void main(String[] args) throws Exception {
     Map<String, String> expConfigs = parseJsonToMap(args[0]);
     expType = expConfigs.get("exp_type");
+    populate = expConfigs.get("populate");
     numDataFiles = Integer.parseInt(expConfigs.get("num_data_files"));
     numMeasures = Integer.parseInt(expConfigs.get("num_measures"));
     selectivity = Integer.parseInt(expConfigs.get("selectivity"));
@@ -262,6 +265,7 @@ public class ExtendedMORRead {
     initS3();
     engine = DefaultEngine.create(hadoopConf);
     s3Executors = Executors.newFixedThreadPool(txnPerCompaction + 1);
+    readExecutors = Executors.newFixedThreadPool(32);
     if (expType.equals("raven")) {
       runRavenExp(expConfigs);
     } else {
@@ -269,27 +273,35 @@ public class ExtendedMORRead {
     }
 
     s3Executors.shutdown();
+    readExecutors.shutdown();
 
   }
 
   private static void runRavenExp(Map<String, String> expConfigs) {
     String location = String.format("%s/%s.db/%s", warehouseLocation, dbName, tableName);
     table = Table.forPath(engine, location);
-    TransactionBuilder txnBuilder = table.createTransactionBuilder(engine, "Examples", Operation.CREATE_TABLE);
-    txnBuilder = txnBuilder.withSchema(engine, SCHEMA);
-    Transaction txn = txnBuilder.build(engine);
-    TransactionCommitResult commitResult = txn.commit(engine, CloseableIterable.emptyIterable());
-    List<PostCommitHook> postCommitHooks = commitResult.getPostCommitHooks();
-    for (PostCommitHook postCommitHook : postCommitHooks) {
-      try {
-        postCommitHook.threadSafeInvoke(engine);
-      } catch (IOException e) {
-        throw new RuntimeException(e);
+
+    if (populate.equals("true")) {
+      TransactionBuilder txnBuilder = table.createTransactionBuilder(engine, "Examples", Operation.CREATE_TABLE);
+      txnBuilder = txnBuilder.withSchema(engine, SCHEMA);
+      Transaction txn = txnBuilder.build(engine);
+      TransactionCommitResult commitResult = txn.commit(engine, CloseableIterable.emptyIterable());
+      List<PostCommitHook> postCommitHooks = commitResult.getPostCommitHooks();
+      for (PostCommitHook postCommitHook : postCommitHooks) {
+        try {
+          postCommitHook.threadSafeInvoke(engine);
+        } catch (IOException e) {
+          throw new RuntimeException(e);
+        }
       }
     }
 
     ravenCatalog = new RavenCatalog(ravenAddress);
-    populateRavenExp();
+
+    if (populate.equals("true")) {
+      populateRavenExp();
+    }
+
     try {
       runRavenExpImpl();
     } catch (Exception e) {
@@ -307,20 +319,24 @@ public class ExtendedMORRead {
   private static void runVanillaExp(Map<String, String> expConfigs) {
     String location = String.format("%s/%s.db/%s", warehouseLocation, dbName, tableName);
     table = Table.forPath(engine, location);
-    TransactionBuilder txnBuilder = table.createTransactionBuilder(engine, "Examples", Operation.CREATE_TABLE);
-    txnBuilder = txnBuilder.withSchema(engine, SCHEMA);
-    Transaction txn = txnBuilder.build(engine);
-    TransactionCommitResult commitResult = txn.commit(engine, CloseableIterable.emptyIterable());
-    List<PostCommitHook> postCommitHooks = commitResult.getPostCommitHooks();
-    for (PostCommitHook postCommitHook : postCommitHooks) {
-      try {
-        postCommitHook.threadSafeInvoke(engine);
-      } catch (IOException e) {
-        throw new RuntimeException(e);
+
+    if (populate.equals("true")) {
+      TransactionBuilder txnBuilder = table.createTransactionBuilder(engine, "Examples", Operation.CREATE_TABLE);
+      txnBuilder = txnBuilder.withSchema(engine, SCHEMA);
+      Transaction txn = txnBuilder.build(engine);
+      TransactionCommitResult commitResult = txn.commit(engine, CloseableIterable.emptyIterable());
+      List<PostCommitHook> postCommitHooks = commitResult.getPostCommitHooks();
+      for (PostCommitHook postCommitHook : postCommitHooks) {
+        try {
+          postCommitHook.threadSafeInvoke(engine);
+        } catch (IOException e) {
+          throw new RuntimeException(e);
+        }
       }
+
+      populateVanillaExp();
     }
 
-    populateVanillaExp();
     try {
       runVanillaExpImpl();
     } catch (Exception e) {
@@ -488,10 +504,8 @@ public class ExtendedMORRead {
               new And(new Predicate(">=", new Column("ss_sold_date_sk"), Literal.ofInt(lowerBound)),
                       new Predicate("<", new Column("ss_sold_date_sk"), Literal.ofInt(upperBound)));
 
-
-
+      List<FileStatus> fileStatusToScan = Lists.newArrayList();
       // retrieve newdata files to merge from Raven
-      List<FileStatus> filesToMerge = Lists.newArrayList();
       String query = String.format(Locale.getDefault(),
               "SELECT file_path, file_size FROM FILELIST SNAPSHOT TableSnapshot(%d, %d) WHERE tag = 'newdata'",
               tableObject.getSnapshotObjId(), tableObject.getSnapshotVid());
@@ -503,7 +517,7 @@ public class ExtendedMORRead {
         String size = new String(resultSet, bufIter.dataIdx(), bufIter.elemSize(), UTF_8);
         bufIter.next();
 
-        filesToMerge.add(FileStatus.of(path, Long.parseLong(size), 0L));
+        fileStatusToScan.add(FileStatus.of(path, Long.parseLong(size), 0L));
       }
 
       Scan scan = snapshot.getScanBuilder().withReadSchema(SCHEMA).withFilter(predicate).build();
@@ -514,9 +528,9 @@ public class ExtendedMORRead {
       Instant afterListFiles = Instant.now();
 
       List<String> filesToScan = Lists.newArrayList();
-
+      StructType physicalReadSchema;
       try {
-        StructType physicalReadSchema =
+        physicalReadSchema =
                 ScanStateRow.getPhysicalDataReadSchema(engine, scanState);
         while (scanFileIter.hasNext()) {
           FilteredColumnarBatch scanFilesBatch = scanFileIter.next();
@@ -525,49 +539,28 @@ public class ExtendedMORRead {
               Row scanFileRow = scanFileRows.next();
 
               FileStatus fileStatus = InternalScanFileUtils.getAddFileStatus(scanFileRow);
-              filesToScan.add(fileStatus.getPath());
+              fileStatusToScan.add(fileStatus);
 
-              CloseableIterator<ColumnarBatch> physicalDataIter =
-                      engine.getParquetHandler().readParquetFiles(
-                              singletonCloseableIterator(fileStatus),
-                              physicalReadSchema,
-                              Optional.of(predicate));
-              try (CloseableIterator<FilteredColumnarBatch> transformedData =
-                           Scan.transformPhysicalData(
-                                   engine,
-                                   scanState,
-                                   scanFileRow,
-                                   physicalDataIter)) {
-                while (transformedData.hasNext()) {
-                  FilteredColumnarBatch filteredData = transformedData.next();
-                }
-              }
             }
           }
         }
 
-        for (FileStatus fileStatus : filesToMerge) {
+        for (FileStatus fileStatus : fileStatusToScan) {
           filesToScan.add(fileStatus.getPath());
-
-          CloseableIterator<ColumnarBatch> physicalDataIter =
-                  engine.getParquetHandler().readParquetFiles(
-                          singletonCloseableIterator(fileStatus),
-                          physicalReadSchema,
-                          Optional.of(predicate));
-          // rather hacky way to make the default engine scan work... Just using a random scanFileRow. Should work
-          // since we are not using any deletion vector or partitioning.
-          try (CloseableIterator<FilteredColumnarBatch> transformedData =
-                       Scan.transformPhysicalData2(
-                               engine,
-                               scanState,
-                               physicalDataIter)) {
-            while (transformedData.hasNext()) {
-              FilteredColumnarBatch filteredData = transformedData.next();
-            }
-          }
         }
       } finally {
         scanFileIter.close();
+      }
+
+      List<Callable<Boolean>> readTasks = Lists.newArrayList();
+      for (FileStatus fileStatus : fileStatusToScan) {
+        readTasks.add(() -> readParquetFile(fileStatus, physicalReadSchema, predicate, scanState));
+      }
+      try {
+        readExecutors.invokeAll(readTasks);
+      }
+      catch (InterruptedException e) {
+        throw new RuntimeException(e);
       }
 
       Instant afterSelect = Instant.now();
@@ -584,6 +577,33 @@ public class ExtendedMORRead {
 
     }
 
+  }
+
+  private static Boolean readParquetFile(FileStatus fileStatus, StructType physicalReadSchema,
+                                         Predicate predicate, Row scanState) {
+    try {
+      CloseableIterator<ColumnarBatch> physicalDataIter =
+              engine.getParquetHandler().readParquetFiles(
+                      singletonCloseableIterator(fileStatus),
+                      physicalReadSchema,
+                      Optional.of(predicate));
+      // rather hacky way to make the default engine scan work... Just using a random scanFileRow. Should work
+      // since we are not using any deletion vector or partitioning.
+      try (CloseableIterator<FilteredColumnarBatch> transformedData =
+                   Scan.transformPhysicalData2(
+                           engine,
+                           scanState,
+                           physicalDataIter)) {
+        while (transformedData.hasNext()) {
+          FilteredColumnarBatch filteredData = transformedData.next();
+        }
+      }
+    }
+    catch (IOException e) {
+      throw new RuntimeException(e);
+    }
+
+    return true;
   }
 
   private static void populateVanillaExp() {
@@ -652,15 +672,19 @@ public class ExtendedMORRead {
               new And(new Predicate(">=", new Column("ss_sold_date_sk"), Literal.ofInt(lowerBound)),
                       new Predicate("<", new Column("ss_sold_date_sk"), Literal.ofInt(upperBound)));
 
+      List<FileStatus> fileStatusToScan = Lists.newArrayList();
+
       Scan scan = snapshot.getScanBuilder().withReadSchema(SCHEMA).withFilter(predicate).build();
       Row scanState = scan.getScanState(engine);
 
       CloseableIterator<FilteredColumnarBatch> scanFileIter = scan.getScanFiles(engine);
 
       Instant afterListFiles = Instant.now();
+
       List<String> filesToScan = Lists.newArrayList();
+      StructType physicalReadSchema;
       try {
-        StructType physicalReadSchema =
+        physicalReadSchema =
                 ScanStateRow.getPhysicalDataReadSchema(engine, scanState);
         while (scanFileIter.hasNext()) {
           FilteredColumnarBatch scanFilesBatch = scanFileIter.next();
@@ -669,28 +693,28 @@ public class ExtendedMORRead {
               Row scanFileRow = scanFileRows.next();
 
               FileStatus fileStatus = InternalScanFileUtils.getAddFileStatus(scanFileRow);
-              filesToScan.add(fileStatus.getPath());
+              fileStatusToScan.add(fileStatus);
 
-              CloseableIterator<ColumnarBatch> physicalDataIter =
-                      engine.getParquetHandler().readParquetFiles(
-                              singletonCloseableIterator(fileStatus),
-                              physicalReadSchema,
-                              Optional.of(predicate));
-              try (CloseableIterator<FilteredColumnarBatch> transformedData =
-                              Scan.transformPhysicalData(
-                                      engine,
-                                      scanState,
-                                      scanFileRow,
-                                      physicalDataIter)) {
-                while (transformedData.hasNext()) {
-                  FilteredColumnarBatch filteredData = transformedData.next();
-                }
-              }
             }
           }
         }
+
+        for (FileStatus fileStatus : fileStatusToScan) {
+          filesToScan.add(fileStatus.getPath());
+        }
       } finally {
         scanFileIter.close();
+      }
+
+      List<Callable<Boolean>> readTasks = Lists.newArrayList();
+      for (FileStatus fileStatus : fileStatusToScan) {
+        readTasks.add(() -> readParquetFile(fileStatus, physicalReadSchema, predicate, scanState));
+      }
+      try {
+        readExecutors.invokeAll(readTasks);
+      }
+      catch (InterruptedException e) {
+        throw new RuntimeException(e);
       }
 
       Instant afterSelect = Instant.now();
